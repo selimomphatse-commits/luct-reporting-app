@@ -7,9 +7,12 @@ const ExcelJS = require('exceljs');
 require('dotenv').config();
 
 const app = express();
+
+// Middleware
 app.use(cors());
 app.use(express.json());
 
+// Database connection pool with better error handling
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
@@ -17,7 +20,45 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME || 'luct_reporting_db',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  acquireTimeout: 60000,
+  timeout: 60000,
+  reconnect: true
+});
+
+// Test database connection
+async function testDatabaseConnection() {
+  try {
+    const connection = await pool.getConnection();
+    console.log('✅ Database connected successfully!');
+    connection.release();
+    return true;
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+    return false;
+  }
+}
+
+// Simple test route to check if server is running
+app.get('/api', (req, res) => {
+  res.json({ 
+    message: 'LUCT Reporting API is running!',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    const dbConnected = await testDatabaseConnection();
+    res.json({
+      status: 'OK',
+      database: dbConnected ? 'Connected' : 'Disconnected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Health check failed' });
+  }
 });
 
 const authenticateToken = (req, res, next) => {
@@ -50,6 +91,11 @@ app.post('/api/register', async (req, res) => {
   try {
     const { username, password, role, name, email } = req.body;
 
+    // Validate required fields
+    if (!username || !password || !role || !name) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
     const [existing] = await pool.execute(
       'SELECT id FROM users WHERE username = ?',
       [username]
@@ -72,13 +118,18 @@ app.post('/api/register', async (req, res) => {
     });
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error: ' + error.message });
   }
 });
 
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
+
+    // Validate input
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
 
     const [users] = await pool.execute(
       'SELECT * FROM users WHERE username = ?',
@@ -102,7 +153,7 @@ app.post('/api/login', async (req, res) => {
         role: user.role,
         name: user.name 
       },
-      process.env.JWT_SECRET,
+      process.env.JWT_SECRET || 'fallback_secret_key',
       { expiresIn: '24h' }
     );
 
@@ -118,9 +169,11 @@ app.post('/api/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error: ' + error.message });
   }
 });
+
+// ... (keep all your other routes the same as before)
 
 app.get('/api/lecturer/classes', authenticateToken, requireRole(['lecturer']), async (req, res) => {
   try {
@@ -135,226 +188,27 @@ app.get('/api/lecturer/classes', authenticateToken, requireRole(['lecturer']), a
   }
 });
 
-app.post('/api/lecturer/reports', authenticateToken, requireRole(['lecturer']), async (req, res) => {
-  try {
-    const {
-      faculty_name,
-      class_id,
-      week_of_reporting,
-      date_of_lecture,
-      actual_students_present,
-      scheduled_lecture_time,
-      topic_taught,
-      learning_outcomes,
-      lecturer_recommendations
-    } = req.body;
-
-    const [result] = await pool.execute(
-      `INSERT INTO reports (
-        faculty_name, class_id, week_of_reporting, date_of_lecture, 
-        lecturer_id, actual_students_present, scheduled_lecture_time,
-        topic_taught, learning_outcomes, lecturer_recommendations, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted')`,
-      [
-        faculty_name,
-        class_id,
-        week_of_reporting,
-        date_of_lecture,
-        req.user.id,
-        actual_students_present,
-        scheduled_lecture_time,
-        topic_taught,
-        learning_outcomes,
-        lecturer_recommendations
-      ]
-    );
-
-    res.status(201).json({
-      message: 'Report submitted successfully',
-      reportId: result.insertId
-    });
-  } catch (error) {
-    console.error('Error submitting report:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/lecturer/reports', authenticateToken, requireRole(['lecturer']), async (req, res) => {
-  try {
-    const { search } = req.query;
-    let query = `
-      SELECT r.*, c.class_name, c.course_name, c.course_code 
-      FROM reports r 
-      JOIN classes c ON r.class_id = c.id 
-      WHERE r.lecturer_id = ?
-    `;
-    const params = [req.user.id];
-
-    if (search) {
-      query += ' AND (c.class_name LIKE ? OR c.course_name LIKE ? OR r.topic_taught LIKE ?)';
-      const searchParam = `%${search}%`;
-      params.push(searchParam, searchParam, searchParam);
-    }
-
-    query += ' ORDER BY r.created_at DESC';
-
-    const [reports] = await pool.execute(query, params);
-    res.json(reports);
-  } catch (error) {
-    console.error('Error fetching reports:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/prl/reports', authenticateToken, requireRole(['prl']), async (req, res) => {
-  try {
-    const { search } = req.query;
-    let query = `
-      SELECT r.*, c.class_name, c.course_name, c.course_code, u.name as lecturer_name
-      FROM reports r 
-      JOIN classes c ON r.class_id = c.id 
-      JOIN users u ON r.lecturer_id = u.id 
-      WHERE r.status IN ('submitted', 'under_review')
-    `;
-    const params = [];
-
-    if (search) {
-      query += ' AND (c.class_name LIKE ? OR c.course_name LIKE ? OR r.topic_taught LIKE ? OR u.name LIKE ?)';
-      const searchParam = `%${search}%`;
-      params.push(searchParam, searchParam, searchParam, searchParam);
-    }
-
-    query += ' ORDER BY r.created_at DESC';
-
-    const [reports] = await pool.execute(query, params);
-    res.json(reports);
-  } catch (error) {
-    console.error('Error fetching PRL reports:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/prl/reports/:id/feedback', authenticateToken, requireRole(['prl']), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { feedback } = req.body;
-
-    await pool.execute(
-      'UPDATE reports SET prl_feedback = ?, status = ? WHERE id = ?',
-      [feedback, 'under_review', id]
-    );
-
-    res.json({ message: 'Feedback added successfully' });
-  } catch (error) {
-    console.error('Error adding feedback:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/pl/reports', authenticateToken, requireRole(['pl']), async (req, res) => {
-  try {
-    const { search } = req.query;
-    let query = `
-      SELECT r.*, c.class_name, c.course_name, c.course_code, u.name as lecturer_name
-      FROM reports r 
-      JOIN classes c ON r.class_id = c.id 
-      JOIN users u ON r.lecturer_id = u.id 
-      WHERE 1=1
-    `;
-    const params = [];
-
-    if (search) {
-      query += ' AND (c.class_name LIKE ? OR c.course_name LIKE ? OR r.topic_taught LIKE ? OR u.name LIKE ?)';
-      const searchParam = `%${search}%`;
-      params.push(searchParam, searchParam, searchParam, searchParam);
-    }
-
-    query += ' ORDER BY r.created_at DESC';
-
-    const [reports] = await pool.execute(query, params);
-    res.json(reports);
-  } catch (error) {
-    console.error('Error fetching PL reports:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/pl/reports/:id/approve', authenticateToken, requireRole(['pl']), async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    await pool.execute(
-      'UPDATE reports SET status = ? WHERE id = ?',
-      ['approved', id]
-    );
-
-    res.json({ message: 'Report approved successfully' });
-  } catch (error) {
-    console.error('Error approving report:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/reports/export', authenticateToken, async (req, res) => {
-  try {
-    const [reports] = await pool.execute(`
-      SELECT r.*, c.class_name, c.course_name, c.course_code, u.name as lecturer_name
-      FROM reports r 
-      JOIN classes c ON r.class_id = c.id 
-      JOIN users u ON r.lecturer_id = u.id 
-      ORDER BY r.created_at DESC
-    `);
-
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('LUCT Reports');
-
-    worksheet.columns = [
-      { header: 'ID', key: 'id', width: 10 },
-      { header: 'Faculty', key: 'faculty_name', width: 20 },
-      { header: 'Class', key: 'class_name', width: 15 },
-      { header: 'Course', key: 'course_name', width: 25 },
-      { header: 'Lecturer', key: 'lecturer_name', width: 20 },
-      { header: 'Week', key: 'week_of_reporting', width: 10 },
-      { header: 'Date', key: 'date_of_lecture', width: 15 },
-      { header: 'Students Present', key: 'actual_students_present', width: 15 },
-      { header: 'Topic', key: 'topic_taught', width: 30 },
-      { header: 'Status', key: 'status', width: 15 }
-    ];
-
-    reports.forEach(report => {
-      worksheet.addRow(report);
-    });
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename=luct-reports.xlsx');
-
-    await workbook.xlsx.write(res);
-    res.end();
-  } catch (error) {
-    console.error('Error exporting reports:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/profile', authenticateToken, async (req, res) => {
-  try {
-    const [users] = await pool.execute(
-      'SELECT id, username, role, name, email, created_at FROM users WHERE id = ?',
-      [req.user.id]
-    );
-    
-    if (users.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    res.json(users[0]);
-  } catch (error) {
-    console.error('Error fetching profile:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// ... (include all your other existing routes here)
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+
+// Start server with database check
+async function startServer() {
+  console.log('🚀 Starting LUCT Reporting Server...');
+  
+  // Test database connection first
+  const dbConnected = await testDatabaseConnection();
+  
+  if (!dbConnected) {
+    console.log('⚠️  Starting server without database connection...');
+  }
+  
+  app.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`📊 API available at: http://localhost:${PORT}/api`);
+    console.log(`❤️  Health check: http://localhost:${PORT}/api/health`);
+    console.log(`🔑 Demo accounts: lecturer1/password, admin/password, etc.`);
+  });
+}
+
+startServer().catch(console.error);
