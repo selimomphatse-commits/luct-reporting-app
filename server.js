@@ -1,18 +1,16 @@
+// server.js
+require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const ExcelJS = require('exceljs');
-require('dotenv').config();
 
 const app = express();
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Database connection pool with better error handling
+// Create pool (reads from .env)
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
@@ -21,194 +19,242 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  acquireTimeout: 60000,
-  timeout: 60000,
-  reconnect: true
 });
 
-// Test database connection
+// Helper: test DB connection
 async function testDatabaseConnection() {
   try {
-    const connection = await pool.getConnection();
-    console.log('✅ Database connected successfully!');
-    connection.release();
+    const conn = await pool.getConnection();
+    conn.release();
+    console.log('✅ Database connected successfully.');
     return true;
-  } catch (error) {
-    console.error('❌ Database connection failed:', error.message);
+  } catch (err) {
+    console.error('❌ Database connection failed:', err.message);
     return false;
   }
 }
 
-// Simple test route to check if server is running
-app.get('/api', (req, res) => {
-  res.json({ 
-    message: 'LUCT Reporting API is running!',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Health check endpoint
-app.get('/api/health', async (req, res) => {
-  try {
-    const dbConnected = await testDatabaseConnection();
-    res.json({
-      status: 'OK',
-      database: dbConnected ? 'Connected' : 'Disconnected',
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Health check failed' });
-  }
-});
-
+// JWT auth middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Access token required' });
 
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
+  jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret_key', (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid or expired token' });
     req.user = user;
     next();
   });
 };
 
-const requireRole = (roles) => {
-  return (req, res, next) => {
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
-    }
-    next();
-  };
+// Role guard helper
+const requireRole = (roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Insufficient permissions' });
+  }
+  next();
 };
 
+// Basic route
+app.get('/api', (req, res) => {
+  res.json({ message: 'LUCT Reporting API running', timestamp: new Date().toISOString() });
+});
+
+// Health
+app.get('/api/health', async (req, res) => {
+  const ok = await testDatabaseConnection();
+  res.json({ status: ok ? 'OK' : 'DB connection failed', timestamp: new Date().toISOString() });
+});
+
+/**
+ * USER / AUTH routes
+ * Single "users" table stores all accounts: role = 'lecturer' | 'student' | 'admin' | 'prl'
+ * Additional profile tables optionally store more info: lecturer_profiles, student_profiles, prl_profiles
+ */
+
+// Register (open or admin-only — here it's open but you can require admin by uncommenting requireRole)
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password, role, name, email } = req.body;
-
-    // Validate required fields
     if (!username || !password || !role || !name) {
-      return res.status(400).json({ error: 'All fields are required' });
+      return res.status(400).json({ error: 'username, password, role and name are required' });
     }
 
-    const [existing] = await pool.execute(
-      'SELECT id FROM users WHERE username = ?',
-      [username]
-    );
+    // check existing username
+    const [rows] = await pool.execute('SELECT id FROM users WHERE username = ?', [username]);
+    if (rows.length > 0) return res.status(400).json({ error: 'Username already exists' });
 
-    if (existing.length > 0) {
-      return res.status(400).json({ error: 'Username already exists' });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
+    const hashed = await bcrypt.hash(password, 10);
     const [result] = await pool.execute(
       'INSERT INTO users (username, password, role, name, email) VALUES (?, ?, ?, ?, ?)',
-      [username, hashedPassword, role, name, email]
+      [username, hashed, role, name, email || null]
     );
 
-    res.status(201).json({ 
-      message: 'User registered successfully',
-      userId: result.insertId 
-    });
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'Internal server error: ' + error.message });
+    const userId = result.insertId;
+
+    // create role-specific profile row if needed
+    if (role === 'lecturer') {
+      await pool.execute('INSERT INTO lecturer_profiles (user_id, full_name, email) VALUES (?, ?, ?)', [userId, name, email || null]);
+    } else if (role === 'student') {
+      await pool.execute('INSERT INTO student_profiles (user_id, full_name, email) VALUES (?, ?, ?)', [userId, name, email || null]);
+    } else if (role === 'prl') {
+      await pool.execute('INSERT INTO prl_profiles (user_id, full_name, email) VALUES (?, ?, ?)', [userId, name, email || null]);
+    } else if (role === 'admin') {
+      // nothing extra needed but you could add admin_profiles
+    }
+
+    res.status(201).json({ message: 'User registered', userId });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).json({ error: 'Internal server error: ' + err.message });
   }
 });
 
+// Login
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'username & password required' });
 
-    // Validate input
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
-    }
+    const [rows] = await pool.execute('SELECT * FROM users WHERE username = ?', [username]);
+    if (rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const [users] = await pool.execute(
-      'SELECT * FROM users WHERE username = ?',
-      [username]
-    );
-
-    if (users.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const user = users[0];
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    const user = rows[0];
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
 
     const token = jwt.sign(
-      { 
-        id: user.id, 
-        username: user.username, 
-        role: user.role,
-        name: user.name 
-      },
+      { id: user.id, username: user.username, role: user.role, name: user.name },
       process.env.JWT_SECRET || 'fallback_secret_key',
       { expiresIn: '24h' }
     );
 
     res.json({
       token,
-      user: {
-        id: user.id,
-        username: user.username,
-        role: user.role,
-        name: user.name,
-        email: user.email
-      }
+      user: { id: user.id, username: user.username, role: user.role, name: user.name, email: user.email }
     });
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error: ' + error.message });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ... (keep all your other routes the same as before)
+/**
+ * CRUD endpoints for lecturers, students, admins, prl
+ * - Create endpoints actually create entries via /api/register (shared)
+ * - Below: list, get by id, update (admin or owner), delete (admin)
+ */
 
+// List users by role (admin or same role user)
+app.get('/api/users/:role', authenticateToken, async (req, res) => {
+  const role = req.params.role;
+  if (!['lecturer', 'student', 'admin', 'prl'].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  try {
+    // Admins can see all; lecturers/prl/students can list only their own role
+    if (req.user.role !== 'admin' && req.user.role !== role) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    const [rows] = await pool.execute('SELECT id, username, role, name, email, created_at FROM users WHERE role = ?', [role]);
+    res.json(rows);
+  } catch (err) {
+    console.error('List users error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get user by id
+app.get('/api/user/:id', authenticateToken, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  try {
+    // Admins can access any user; users can access their own record; otherwise forbidden
+    if (req.user.role !== 'admin' && req.user.id !== id) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    const [rows] = await pool.execute('SELECT id, username, role, name, email, created_at FROM users WHERE id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Get user error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update user (admin or owner)
+app.put('/api/user/:id', authenticateToken, async (req, res) => {
+  const id = Number(req.params.id);
+  const { name, email, password } = req.body;
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  try {
+    if (req.user.role !== 'admin' && req.user.id !== id) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    const updates = [];
+    const params = [];
+
+    if (name) { updates.push('name = ?'); params.push(name); }
+    if (email) { updates.push('email = ?'); params.push(email); }
+    if (password) {
+      const hashed = await bcrypt.hash(password, 10);
+      updates.push('password = ?'); params.push(hashed);
+    }
+
+    if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+
+    params.push(id);
+    const sql = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
+    await pool.execute(sql, params);
+    res.json({ message: 'User updated' });
+  } catch (err) {
+    console.error('Update user error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete user (admin only)
+app.delete('/api/user/:id', authenticateToken, requireRole(['admin']), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  try {
+    await pool.execute('DELETE FROM users WHERE id = ?', [id]);
+    // optionally remove profiles
+    await pool.execute('DELETE FROM lecturer_profiles WHERE user_id = ?', [id]);
+    await pool.execute('DELETE FROM student_profiles WHERE user_id = ?', [id]);
+    await pool.execute('DELETE FROM prl_profiles WHERE user_id = ?', [id]);
+    res.json({ message: 'User deleted' });
+  } catch (err) {
+    console.error('Delete user error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Example: lecturer-specific endpoint to list their classes (requires role lecturer)
 app.get('/api/lecturer/classes', authenticateToken, requireRole(['lecturer']), async (req, res) => {
   try {
-    const [classes] = await pool.execute(
-      'SELECT * FROM classes WHERE lecturer_id = ?',
-      [req.user.id]
-    );
-    res.json(classes);
-  } catch (error) {
-    console.error('Error fetching classes:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    const [rows] = await pool.execute('SELECT * FROM classes WHERE lecturer_id = ?', [req.user.id]);
+    res.json(rows);
+  } catch (err) {
+    console.error('Lecturer classes error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ... (include all your other existing routes here)
-
+// Start server
 const PORT = process.env.PORT || 5000;
-
-// Start server with database check
-async function startServer() {
-  console.log('🚀 Starting LUCT Reporting Server...');
-  
-  // Test database connection first
-  const dbConnected = await testDatabaseConnection();
-  
-  if (!dbConnected) {
-    console.log('⚠️  Starting server without database connection...');
+(async () => {
+  console.log('Starting server...');
+  const ok = await testDatabaseConnection();
+  if (!ok) {
+    console.warn('Warning: Database connection failed. Fix .env or MySQL server before using DB routes.');
   }
-  
   app.listen(PORT, () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`📊 API available at: http://localhost:${PORT}/api`);
-    console.log(`❤️  Health check: http://localhost:${PORT}/api/health`);
-    console.log(`🔑 Demo accounts: lecturer1/password, admin/password, etc.`);
+    console.log(`Server listening on port ${PORT}`);
+    console.log(`API root: http://localhost:${PORT}/api`);
   });
-}
-
-startServer().catch(console.error);
+})();
